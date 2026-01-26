@@ -6,15 +6,16 @@
 ## Table of Contents
 
 1. [Executive Overview](#executive-overview)
-2. [SVMDR Standard Workflow](#svmdr-standard-workflow)
-3. [SVMDR Pseudo (Custom) Workflow](#svmdr-pseudo-custom-workflow)
-4. [QuickDR Workflow](#quickdr-workflow)
-5. [SnapMirror Operations Tracking](#snapmirror-operations-tracking)
-6. [The svm_clone Role Deep Dive](#the-svm_clone-role-deep-dive)
-7. [Customization Options](#customization-options)
-8. [CIFS Server Management](#cifs-server-management)
-9. [Pre-flight Validation](#pre-flight-validation)
-10. [Integration and Deployment](#integration-and-deployment)
+2. [Prerequisites](#prerequisites)
+3. [SVMDR Standard Workflow](#svmdr-standard-workflow)
+4. [SVMDR Pseudo (Custom) Workflow](#svmdr-pseudo-custom-workflow)
+5. [QuickDR Workflow](#quickdr-workflow)
+6. [SnapMirror Operations Tracking](#snapmirror-operations-tracking)
+7. [The svm_clone Role Deep Dive](#the-svm_clone-role-deep-dive)
+8. [Customization Options](#customization-options)
+9. [CIFS Server Management](#cifs-server-management)
+10. [Pre-flight Validation](#pre-flight-validation)
+11. [Integration and Deployment](#integration-and-deployment)
 
 ---
 
@@ -50,6 +51,52 @@ This automation framework provides three distinct DR workflows built on Ansible,
 ### Compatibility
 
 > **✅ Tested and Validated:** All workflows have been thoroughly tested on **ONTAP 9.14** and are compatible with higher versions. The entire codebase uses **REST API only** strategy, ensuring modern, scalable, and future-proof automation that aligns with NetApp's strategic direction.
+
+---
+
+## Prerequisites
+
+### Ansible Environment
+
+- **Ansible Core**: Version **< 2.18** (Recommended: 2.15.x or 2.16.x)
+- **Python**: 3.8 or higher
+- **Collections**:
+  - `netapp.ontap` (>=21.24.0) - Official Red Hat Certified collection
+  - `netapp_ps.ontap`, `netapp_ps.maf`, `netapp_ps.ontap_specials` - Custom PS collections
+
+```bash
+# Install collections
+ansible-galaxy collection install netapp.ontap
+ansible-galaxy collection install -r requirements.yml
+```
+
+### ONTAP Requirements
+
+- **Version**: ONTAP 9.14.1 or higher
+- **Connectivity**: HTTPS (443) access to cluster management LIFs
+- **Credentials**: Cluster admin or RBAC role with sufficient privileges
+- **Licenses**: SnapMirror, FlexClone, CIFS (as needed)
+- **Cluster Peering**: Established for DR workflows with intercluster LIFs configured
+
+### Deployment Options
+
+**Direct Ansible CLI**: Linux/Unix system with Ansible and Python environment
+
+**AnsibleForms**: Docker or Podman container host (4 GB RAM, 20 GB disk)
+```bash
+docker run -d --name ansibleforms -p 8000:8000 \
+  -v /path/to/playbooks:/playbooks ansibleforms:latest
+```
+
+**CI/CD Integration**: Jenkins, GitLab CI, or GitHub Actions with Ansible runner
+
+### Verification
+
+```bash
+ansible --version                                          # Check version < 2.18
+ansible-galaxy collection list | grep netapp              # Verify collections
+ansible-playbook --syntax-check svmdr_standard.yml        # Validate playbook
+```
 
 ---
 
