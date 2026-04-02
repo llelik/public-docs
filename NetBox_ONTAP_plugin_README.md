@@ -240,34 +240,61 @@ Enforced via Django `clean()` on all models:
 
 ## Ansible Integration
 
-Every API endpoint has a dedicated pair of Ansible modules:
+The `netapp_ps.ontap_netbox` Ansible collection provides three categories of modules:
 
-| API Endpoint | CUD Module | Lookup Module |
-|-------------|-----------|---------------|
-| `clusters/` | `nb_ontap_cluster` | `nb_ontap_cluster_lookup` |
-| `nodes/` | `nb_ontap_node` | `nb_ontap_node_lookup` |
-| `tiers/` | `nb_ontap_tier` | `nb_ontap_tier_lookup` |
-| `svms/` | `nb_ontap_svm` | `nb_ontap_svm_lookup` |
-| `volumes/` | `nb_ontap_volume` | `nb_ontap_volume_lookup` |
-| `qtrees/` | `nb_ontap_qtree` | `nb_ontap_qtree_lookup` |
-| `quota-rules/` | `nb_ontap_quota_rule` | `nb_ontap_quota_rule_lookup` |
-| `luns/` | `nb_ontap_lun` | `nb_ontap_lun_lookup` |
-| `interfaces/` | `nb_ontap_interface` | `nb_ontap_interface_lookup` |
-| `export-policies/` | `nb_ontap_export_policy` | `nb_ontap_export_policy_lookup` |
-| `export-policy-rules/` | `nb_ontap_export_policy_rule` | `nb_ontap_export_policy_rule_lookup` |
-| `snapshot-policies/` | `nb_ontap_snapshot_policy` | `nb_ontap_snapshot_policy_lookup` |
-| `snapmirror-policies/` | `nb_ontap_snapmirror_policy` | `nb_ontap_snapmirror_policy_lookup` |
-| `job-schedules/` | `nb_ontap_job_schedule` | `nb_ontap_job_schedule_lookup` |
-| `snapmirror-relationships/` | `nb_ontap_snapmirror` | `nb_ontap_snapmirror_lookup` |
+### Single-Item Modules (CUD)
 
-- **CUD modules** — Create, Update, Delete with full idempotency (`state: present` / `state: absent`). Support all writable fields from the serializer including nested FK resolution by name.
-- **Lookup modules** — Read-only query returning matching objects. Support all filter parameters from the filterset. Usable in `set_fact`, `loop`, and conditional logic.
+One module per object type for idempotent Create, Update, Delete operations (`state: present` / `state: absent`). Support nested FK resolution by name.
+
+| Module | API Endpoint |
+|--------|-------------|
+| `ontap_netbox_cluster` | `clusters/` |
+| `ontap_netbox_node` | `nodes/` |
+| `ontap_netbox_tier` | `tiers/` |
+| `ontap_netbox_svm` | `svms/` |
+| `ontap_netbox_volume` | `volumes/` |
+| `ontap_netbox_qtree` | `qtrees/` |
+| `ontap_netbox_quota_rule` | `quota-rules/` |
+| `ontap_netbox_lun` | `luns/` |
+| `ontap_netbox_interface` | `interfaces/` |
+| `ontap_netbox_export_policy` | `export-policies/` |
+| `ontap_netbox_export_policy_rule` | `export-policy-rules/` |
+| `ontap_netbox_snapshot_policy` | `snapshot-policies/` |
+| `ontap_netbox_snapmirror_policy` | `snapmirror-policies/` |
+| `ontap_netbox_job_schedule` | `job-schedules/` |
+| `ontap_netbox_snapmirror` | `snapmirror-relationships/` |
+| `ontap_netbox_nas_share` | `shares/` |
+| `ontap_netbox_nas_mount_point` | `mount-points/` |
+
+### Bulk Modules
+
+High-performance bulk operations for large-scale imports (10–15x faster than individual calls). Batch size configurable (default: 100).
+
+| Module | Description |
+|--------|-------------|
+| `ontap_netbox_svm_bulk` | Bulk SVMs |
+| `ontap_netbox_volume_bulk` | Bulk volumes |
+| `ontap_netbox_qtree_bulk` | Bulk qtrees |
+| `ontap_netbox_quota_rule_bulk` | Bulk quota rules |
+| `ontap_netbox_lun_bulk` | Bulk LUNs |
+| `ontap_netbox_interface_bulk` | Bulk interfaces |
+| `ontap_netbox_export_policy_bulk` | Bulk export policies |
+| `ontap_netbox_export_policy_rule_bulk` | Bulk export policy rules |
+| `ontap_netbox_snapshot_policy_bulk` | Bulk snapshot policies |
+| `ontap_netbox_snapmirror_policy_bulk` | Bulk SnapMirror policies |
+| `ontap_netbox_job_schedule_bulk` | Bulk job schedules |
+
+### Lookup Plugin
+
+A single lookup plugin `ontap_lookup` queries any ONTAP object type from NetBox. The object type is specified as the first argument using dot-prefixed terms (`ontap.*` for infrastructure, `nastenant.*` for services).
+
+Supported terms: `ontap.clusters`, `ontap.svms`, `ontap.volumes`, `ontap.qtrees`, `ontap.quota-rules`, `ontap.luns`, `ontap.interfaces`, `ontap.export-policies`, `ontap.export-policy-rules`, `ontap.snapshot-policies`, `ontap.snapmirror-policies`, `ontap.job-schedules`, `ontap.snapmirror-relationships`, `ontap.nodes`, `ontap.tiers`, `nastenant.shares`, `nastenant.mount-points`.
 
 ### CUD Module Example
 
 ```yaml
 - name: Ensure volume exists in NetBox
-  nb_ontap_volume:
+  netapp_ps.ontap_netbox.ontap_netbox_volume:
     netbox_url: "https://{{ netbox_host }}"
     netbox_token: "{{ netbox_token }}"
     state: present
@@ -288,28 +315,26 @@ Every API endpoint has a dedicated pair of Ansible modules:
         svm__cluster__name: "cluster01"
 ```
 
-### Lookup Module Example
+### Lookup Plugin Example
 
 ```yaml
 - name: Get all DP volumes on svm_dr
-  nb_ontap_volume_lookup:
-    netbox_url: "https://{{ netbox_host }}"
-    netbox_token: "{{ netbox_token }}"
-    filter_params:
-      svm__name: svm_dr
-      voltype: DP
-  register: dp_volumes
+  ansible.builtin.set_fact:
+    dp_volumes: "{{ query('netapp_ps.ontap_netbox.ontap_lookup', 'ontap.volumes',
+                          api_endpoint=netbox_url,
+                          api_filter='svm__name=svm_dr voltype=DP',
+                          token=netbox_token) }}"
 
 - name: Show volume names
-  debug:
-    msg: "{{ dp_volumes.results | map(attribute='name') | list }}"
+  ansible.builtin.debug:
+    msg: "{{ dp_volumes | map(attribute='value') | map(attribute='name') | list }}"
 ```
 
 ### Sync SnapMirror Policies from ONTAP
 
 ```yaml
 - name: Sync SnapMirror policy to NetBox
-  nb_ontap_snapmirror_policy:
+  netapp_ps.ontap_netbox.ontap_netbox_snapmirror_policy:
     netbox_url: "https://{{ netbox_host }}"
     netbox_token: "{{ netbox_token }}"
     state: present
