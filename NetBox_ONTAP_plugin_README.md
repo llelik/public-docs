@@ -335,6 +335,62 @@ An optional services layer sits on top of the infrastructure models to track NAS
 
 The services layer is independent — the infrastructure models work standalone without it.
 
+## ONTAP Data Import & Sync
+
+### Initial Import (Fresh Installation)
+
+For a new NetBox deployment with no existing ONTAP data, use the **bulk import** playbook:
+
+```bash
+ansible-playbook netbox_ontap_import_bulk.yml -i inventory.yml
+```
+
+The import runs against all ONTAP clusters in the inventory and populates NetBox in dependency order:
+
+1. **Clusters & Nodes** — registers cluster identity and node inventory
+2. **Tiers/Aggregates** — physical storage tiers per node
+3. **SVMs** — all data, admin, and system SVMs with enabled services
+4. **Volumes** — all volumes with export policies, snapshot policies, encryption state
+5. **Qtrees** — nested under their parent volumes
+6. **Quota Rules** — tree/user/group quotas linked to volumes and qtrees
+7. **LUNs** — SAN objects linked to volumes and optional qtrees
+8. **Interfaces** — IP addresses, home ports, services, IPspace awareness
+9. **Export Policies & Rules** — NFS access control configuration
+10. **Snapshot Policies** — cluster-scoped and SVM-scoped policies
+11. **Job Schedules** — cron and interval schedules
+12. **SnapMirror Policies** — async/sync/continuous policy definitions
+
+Each object type uses bulk API calls (batches of 100) for performance. Existing objects are matched by their unique constraint (e.g., cluster+name for SVMs) and updated if found.
+
+Every object type is backed by a dedicated Ansible role (e.g., `bulk_import_svm`, `bulk_import_volume`, `sync_svm`, `sync_volume`). The playbooks orchestrate these roles in dependency order, but each role can also be invoked independently for targeted import or sync of a single object type.
+
+### Ongoing Sync (Existing Installation)
+
+For environments where NetBox already has ONTAP data, use the **sync** playbook:
+
+```bash
+ansible-playbook netbox_ontap_sync.yml -i inventory.yml
+```
+
+Sync differs from import in three key ways:
+
+- **Orphan detection** — objects present in NetBox but no longer on ONTAP are identified. Controlled by `orphan_action`: `mark` (tags as orphaned) or `delete` (removes from NetBox).
+- **Last-seen tracking** — every synced object gets a `last_seen` timestamp. Objects not seen across sync cycles are candidates for orphan handling.
+- **Configuration drift detection** — each sync role compares the live ONTAP state against what's recorded in NetBox. Field-level differences (e.g., volume size changed, SVM services modified, export policy rules updated) are detected and logged. Drifted objects are updated in NetBox to reflect the current ONTAP state, ensuring NetBox remains the accurate source of truth.
+
+Sync runs the same dependency-ordered collection from ONTAP, then compares against NetBox state per cluster. It creates new objects, updates changed ones, and flags or removes stale entries.
+
+### Sync Reporting
+
+When `generate_report: true` (default), each sync run produces a Markdown report in `report_dir` (`/tmp/netbox_sync_reports` by default) with per-cluster summaries:
+
+- Objects created, updated, unchanged, and orphaned — broken down by type
+- Configuration drift details — which fields changed and their before/after values
+- Orphan inventory — objects marked or deleted with last-seen timestamps
+- Error summary — any failed API calls or object resolution issues
+
+Both playbooks use `nolog: true` for ONTAP credential tasks and support `--limit` to target specific clusters.
+
 ## Requirements
 
 | Component | Version |
