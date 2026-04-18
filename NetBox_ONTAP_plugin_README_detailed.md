@@ -272,7 +272,7 @@ The `automation_spec` field on `TenantNASShare` is a structured JSON document th
 }
 ```
 
-#### `new_app` — Multi-Resource Application Storage
+#### `new_app` — Multi-Resource Application-Aware Storage
 
 This is where it gets interesting. A `new_app` order defines an entire application's storage layout in one document — volumes, qtrees, quotas, export policies, mount points — everything Ansible needs to provision the complete stack.
 
@@ -411,26 +411,99 @@ The spec is always stored, always versioned (NetBox change log), always queryabl
                        └───────────────┘        └──────────────┘
 ```
 
-### Sync Playbook (ONTAP → NetBox)
+### Sync Engine (ONTAP → NetBox)
 
-An import/sync playbook collects live ONTAP state and pushes it into NetBox:
+The `netapp_ps.ontap_netbox` collection ships **sync roles** for every ONTAP object type. These aren't simple importers — they implement a full **detect → compare → apply** cycle with drift detection, orphan handling, and structured reporting.
+
+#### Sync Flow (per object type)
 
 ```
-ONTAP Cluster ──(REST API)──→ Ansible ──(NetBox API)──→ Plugin
-  cluster show                             POST /clusters/
-  node show                                POST /nodes/
-  aggr show                                POST /tiers/
-  vserver show                             POST /svms/
-  volume show                              POST /volumes/
-  qtree show                               POST /qtrees/
-  export-policy show                       POST /export-policies/
-  export-policy rule show                  POST /export-policy-rules/
-  network interface show                   POST /interfaces/
-  snapshot policy show                     POST /snapshot-policies/
-  snapmirror show                          POST /snapmirror-relationships/
+┌──────────────┐     ┌──────────────────┐     ┌──────────────────┐     ┌─────────────┐
+│  1. Collect   │────▶│  2. Compare      │────▶│  3. Apply        │────▶│ 4. Report   │
+│  ONTAP State  │     │  ONTAP vs NetBox │     │  Create/Update/  │     │ Summary +   │
+│  (REST API)   │     │  (Jinja2 delta)  │     │  Orphan (Bulk)   │     │ Markdown    │
+└──────────────┘     └──────────────────┘     └──────────────────┘     └─────────────┘
 ```
 
-This runs idempotently on a schedule (e.g., every 4 hours) to keep NetBox in sync with reality. Drift detection becomes trivial — compare NetBox records against live ONTAP state.
+Each sync role follows the same architecture:
+
+1. **Collect** — Gather live state from ONTAP via `na_ontap_rest_info` / REST API
+2. **Query NetBox** — Fetch current records via `ontap_lookup` plugin with `cluster__name` filter
+3. **Compute delta** — Jinja2 comparison template builds four lists:
+   - `to_create` — In ONTAP but not in NetBox
+   - `to_update` — In both, but fields differ (drift detected)
+   - `to_orphan` — In NetBox but not in ONTAP (stale records)
+   - `unchanged` — No action needed
+4. **Apply** — Bulk create/update via `ontap_netbox_*_bulk` modules (10–15x faster than individual calls)
+5. **Report** — Structured Markdown report with counts, item lists, and changed field details
+
+#### Sync Coverage
+
+| ONTAP Object | Sync Role | Delta Key | Drift Fields Compared |
+|---|---|---|---|
+| Cluster + Nodes + Aggregates | `import_cluster` | name | Full discovery (initial import) |
+| SVMs | `sync_svm` | `name` within cluster | state, enabled_services, subtype, ipspace, aggregates |
+| Volumes | `sync_volume` | `svm:volume` | size, state, aggregates, security_style, junction_path, encryption, export_policy, snapshot_policy, autosize_mode, is_clone, parent_volume, is_sm_protected |
+| Qtrees | `sync_qtree` | `svm:volume:qtree` | security_style, export_policy |
+| LUNs | `sync_lun` | `svm:volume:lun` | size, os_type, state |
+| Interfaces (LIFs) | `sync_interface` | `svm:name` | ip_address, admin_state, home_node, home_port, enabled_services |
+| Export Policies | `sync_export_policy` | `svm:name` | — (existence only) |
+| Export Policy Rules | `sync_export_policy_rule` | `policy:index` | clientmatch, protocols, ro/rw/superuser, allow_suid |
+| Snapshot Policies | `sync_snapshot_policy` | `svm:name` | scope, enabled, ontap_details |
+| Quota Rules | `sync_quota_rule` | `svm:volume:type:target` | space_hard_limit, space_soft_limit, files_hard_limit |
+| SnapMirror Policies | `sync_snapmirror_policy` | `name` | policy_type, sync_type, identity_preservation |
+| SnapMirror Relationships | `sync_snapmirror` | `source:dest` | protection_type, state, policy, schedule |
+
+#### Orphan Handling
+
+Objects that exist in NetBox but no longer exist on ONTAP are handled via configurable `orphan_action`:
+
+- **`mark`** (default) — Sets `ontap_sync_status=Orphaned` custom field. The record stays in NetBox for audit, but is clearly flagged.
+- **`delete`** — Removes the record from NetBox entirely.
+
+Objects with `ontap_sync_exclude=true` are never touched by sync — use this for manually-managed records or records under migration.
+
+#### Sync Report Output
+
+Every sync run generates a Markdown report:
+
+```markdown
+# ONTAP-NetBox Volume Sync Report
+
+**Cluster:** tpc1y110cl
+**Generated:** 2026-04-18T14:30:00+00:00
+**Mode:** APPLIED
+**Orphan Action:** mark
+
+## Summary
+| Metric         | Count |
+|----------------|------:|
+| ONTAP Volumes  |   816 |
+| NetBox Volumes |   814 |
+| **To Create**  |     2 |
+| **To Update**  |     5 |
+| **To Orphan**  |     0 |
+| Unchanged      |   809 |
+| Excluded       |     3 |
+
+## Objects to Update in NetBox
+| Volume               | Changed Fields                          |
+|----------------------|-----------------------------------------|
+| ora_data_3d_22d_1001 | size: 536870912000 → 1073741824000       |
+| ora_arch_3d_22d_1004 | junction_path: /arch_old → /arch_1004    |
+```
+
+This runs idempotently on a schedule (AWX job template, cron, etc.) to keep NetBox in sync with reality. After initial import, typical sync runs complete in under 60 seconds per cluster with the bulk modules.
+
+#### Custom Fields Managed by Sync
+
+The `sync_common` role automatically creates these custom fields on first run:
+
+| Custom Field | Type | Applied To | Purpose |
+|---|---|---|---|
+| `ontap_sync_status` | Selection | SVM, Volume, LUN, Qtree | Lifecycle state: `Active`, `Orphaned`, `Decommissioned` |
+| `ontap_sync_exclude` | Boolean | SVM, Volume, LUN, Qtree | Skip this object during sync (manual override) |
+| `ontap_last_seen` | Datetime | SVM, Volume, LUN, Qtree | Last ONTAP discovery timestamp (ISO 8601) |
 
 ### Custom Fields for Operational Metadata
 
@@ -483,88 +556,284 @@ Each order carries the complete `automation_spec` with all volumes, qtrees, quot
 
 ## Ansible Integration
 
-> **This section will be expanded as modules and playbooks are developed.**
+The plugin's Ansible ecosystem is split across three purpose-built collections. Everything is production-ready — no "planned" placeholders.
 
-### Planned Ansible Modules
+### Collection Architecture
 
-| Module | Purpose | Status |
-|--------|---------|--------|
-| `netbox_ontap_cluster` | Sync ONTAP cluster info to NetBox | Planned |
-| `netbox_ontap_svm` | Sync SVM inventory | Planned |
-| `netbox_ontap_volume` | Sync/create volume records | Planned |
-| `netbox_ontap_qtree` | Sync/create qtree records | Planned |
-| `netbox_ontap_interface` | Sync LIF inventory | Planned |
-| `netbox_ontap_export_policy` | Sync export policies + rules | Planned |
-| `netbox_ontap_snapshot_policy` | Sync snapshot policies | Planned |
-| `netbox_ontap_snapmirror` | Sync SnapMirror relationships | Planned |
-| `netbox_ontap_share` | Create/update tenant share orders | Planned |
-| `netbox_ontap_mount_point` | Create/update mount point records | Planned |
+```
+netapp_ps.ontap_netbox          NetBox CMDB layer — modules, bulk modules, sync roles,
+│                               lookup plugin. Talks to NetBox API.
+│
+netapp_ps.ontap                 *MAF* ONTAP execution layer — 44 roles for direct cluster
+│                               management (volumes, SVMs, export policies, SnapMirror,
+│                               CIFS, SAN, security, QoS). Talks to ONTAP REST API.
+│
+netapp_ps.tollcollect           Orchestration layer — finder_svm, finder_qtree,
+                                finder_vault, netbox_share_status. Bridges NetBox
+                                data model with ONTAP provisioning decisions.
+```
 
-### Planned Playbooks
+### `netapp_ps.ontap_netbox` — NetBox CMDB Modules
 
-#### Sync / Import Playbooks
+#### Single-Object Modules (18)
 
-| Playbook | Purpose |
-|----------|---------|
-| `ontap_full_sync.yml` | Full cluster-to-NetBox sync (all object types) |
-| `ontap_incremental_sync.yml` | Delta sync based on last-modified timestamps |
-| `ontap_volume_sync.yml` | Volume-only sync with custom field population |
-| `ontap_dr_sync.yml` | SnapMirror relationship and policy sync |
+Full CRUD for every ONTAP object type in NetBox. Idempotent, with state=present/absent semantics.
 
-#### Provisioning Playbooks
+| Module | Purpose |
+|--------|--------|
+| `ontap_netbox_cluster` | Manage ONTAP cluster records |
+| `ontap_netbox_node` | Manage node records (serial, model, state) |
+| `ontap_netbox_tier` | Manage aggregates and cloud tiers |
+| `ontap_netbox_svm` | Manage SVMs (data/admin, services, subtype) |
+| `ontap_netbox_volume` | Manage volumes (RW/RO/DP, FlexGroup, clones) |
+| `ontap_netbox_qtree` | Manage qtrees |
+| `ontap_netbox_lun` | Manage LUNs (SAN block storage) |
+| `ontap_netbox_interface` | Manage LIFs (data/mgmt, IPv4/IPv6, services) |
+| `ontap_netbox_export_policy` | Manage NFS export policies |
+| `ontap_netbox_export_policy_rule` | Manage individual export policy rules |
+| `ontap_netbox_quota_rule` | Manage quota rules (user/group/tree) |
+| `ontap_netbox_qos_policy_group` | Manage QoS policy groups |
+| `ontap_netbox_snapshot_policy` | Manage snapshot policies |
+| `ontap_netbox_job_schedule` | Manage job schedules (cron/interval) |
+| `ontap_netbox_snapmirror` | Manage SnapMirror relationships (VSM/SVMDR/CG) |
+| `ontap_netbox_snapmirror_policy` | Manage SnapMirror policies |
+| `ontap_netbox_nas_share` | Manage tenant share orders (automation_spec) |
+| `ontap_netbox_nas_mount_point` | Manage VM-to-storage mount point records |
 
-| Playbook | Purpose |
-|----------|---------|
-| `provision_share_order.yml` | Process pending share orders (status=requested) |
-| `provision_oracle_app.yml` | Oracle-specific provisioning with discovery mode |
-| `provision_mount_points.yml` | Mount NFS/CIFS shares on target VMs |
-| `decommission_share.yml` | Reverse provisioning with cleanup |
-
-#### Workflow Example
+**Example — register a volume in NetBox:**
 
 ```yaml
-# provision_share_order.yml (conceptual)
-- name: Process pending storage orders
-  hosts: localhost
-  vars:
-    netbox_url: "https://netbox.example.com"
-    netbox_token: "{{ vault_netbox_token }}"
+- name: Register volume in NetBox
+  netapp_ps.ontap_netbox.ontap_netbox_volume:
+    netbox_url: "{{ netbox_url }}"
+    netbox_token: "{{ netbox_token }}"
+    state: present
+    data:
+      name: ora_data_3d_22d_1001
+      cluster: { name: prod-cluster-01 }
+      svm: { name: prod-svm-01, cluster: { name: prod-cluster-01 } }
+      size: "500GiB"
+      voltype: RW
+      volstate: online
+      security_style: unix
+      aggregates: [aggr_ssd_01]
+      export_policy: { name: default }
+```
 
-  tasks:
-    - name: Get pending orders
-      uri:
-        url: "{{ netbox_url }}/api/plugins/ontap-nas/shares/?provisioning_status=requested"
-        headers:
-          Authorization: "Token {{ netbox_token }}"
-      register: pending_orders
+#### Bulk Modules (12) — 10–15x Faster
 
-    - name: Process each order
-      include_tasks: process_order.yml
-      loop: "{{ pending_orders.json.results }}"
-      loop_control:
-        loop_var: order
+For large-scale import and sync operations. Process hundreds of objects per API call with batched transactions, partial success handling, and detailed error reporting.
 
-# process_order.yml
-- name: Extract automation spec
-  set_fact:
-    spec: "{{ order.automation_spec.automation_spec }}"
-    order_type: "{{ order.order_type }}"
+| Module | Batch Default |
+|--------|------:|
+| `ontap_netbox_svm_bulk` | 100 |
+| `ontap_netbox_volume_bulk` | 100 |
+| `ontap_netbox_qtree_bulk` | 100 |
+| `ontap_netbox_lun_bulk` | 100 |
+| `ontap_netbox_interface_bulk` | 100 |
+| `ontap_netbox_export_policy_bulk` | 100 |
+| `ontap_netbox_export_policy_rule_bulk` | 100 |
+| `ontap_netbox_quota_rule_bulk` | 100 |
+| `ontap_netbox_snapshot_policy_bulk` | 100 |
+| `ontap_netbox_snapmirror_bulk` | 100 |
+| `ontap_netbox_snapmirror_policy_bulk` | 100 |
+| `ontap_netbox_job_schedule_bulk` | 100 |
 
-- name: Provision storage items
-  include_tasks: "provision_{{ order_type }}.yml"
-  loop: "{{ spec.storage }}"
-  loop_control:
-    loop_var: storage_item
+**Bulk module return structure:**
 
-- name: Update order status
-  uri:
-    url: "{{ netbox_url }}/api/plugins/ontap-nas/shares/{{ order.id }}/"
-    method: PATCH
-    headers:
-      Authorization: "Token {{ netbox_token }}"
-    body_format: json
-    body:
-      provisioning_status: completed
+```yaml
+created: [{id: 101, name: "vol_001"}, ...]    # Successfully created
+updated: [{id: 101, name: "vol_001"}, ...]    # Successfully updated
+deleted: ["101", "102"]                        # Deleted IDs
+errors:  [{index: 2, object: {...}, error: "SVM not found"}]
+batches_processed: 5
+total_objects: 498
+success_rate: 99.6
+msg: "Processed 498/500 volumes in 5 batches"
+```
+
+Key features:
+- **Partial success** — one failed object doesn't block the rest (`fail_on_error=false`)
+- **Smart size parsing** — accepts `"100GB"`, `"1TiB"`, `"500GiB"` or raw bytes
+- **Nested FK resolution** — `svm: {name: "svm_prod", cluster: {name: "cluster1"}}` resolves automatically
+- **FlexGroup support** — `aggregates` list for M2M tier mapping
+
+#### Lookup Plugin — `ontap_lookup`
+
+Query any NetBox ONTAP object from playbooks, roles, or Jinja2 templates. Supports 15+ object types with aliases, Django-style filters, and multiple output formats.
+
+```yaml
+# Query SVMs by purpose and state
+- set_fact:
+    target_svms: "{{ query('netapp_ps.ontap_netbox.ontap_lookup', 'ontap.svms',
+                          api_endpoint=netbox_url, token=netbox_token,
+                          validate_certs=false,
+                          api_filter='cf_ontap_svm_purpose=oracle_nfs admin_state=running') }}"
+
+# Query volumes for a specific SVM
+- set_fact:
+    svm_volumes: "{{ query('netapp_ps.ontap_netbox.ontap_lookup', 'ontap.volumes',
+                          api_endpoint=netbox_url, token=netbox_token,
+                          api_filter='cluster__name=prod-cluster-01 svm=prod-svm-01') }}"
+
+# Query pending share orders
+- set_fact:
+    pending: "{{ query('netapp_ps.ontap_netbox.ontap_lookup', 'nastenant.shares',
+                       api_endpoint=netbox_url, token=netbox_token,
+                       api_filter='provisioning_status=requested') }}"
+```
+
+**Supported terms** (with underscore/hyphen/singular/plural aliases):
+
+| Category | Terms |
+|---|---|
+| Infrastructure | `ontap.clusters`, `ontap.nodes`, `ontap.tiers`, `ontap.svms`, `ontap.volumes`, `ontap.qtrees`, `ontap.luns`, `ontap.interfaces` |
+| Policies | `ontap.export-policies`, `ontap.export-policy-rules`, `ontap.snapshot-policies`, `ontap.quota-rules`, `ontap.job-schedules` |
+| Replication | `ontap.snapmirror-relationships`, `ontap.snapmirror-policies` |
+| Tenant Services | `nastenant.shares`, `nastenant.mount-points` |
+
+**Filter syntax:** space-separated `key=value` pairs. Same key repeated = OR logic; different keys = AND logic.
+
+**Return format** (default):
+```yaml
+[{key: <object_id>, value: {id: 42, name: "svm_prod", cluster: {...}, ...}}, ...]
+```
+
+Set `raw_data=true` to get flat API response objects instead.
+
+#### Sync & Import Roles (37 roles)
+
+Three tiers of data ingestion, each for a different use case:
+
+| Tier | Roles | Use Case | Performance |
+|---|---|---|---|
+| **Import** (13 roles) | `import_cluster`, `import_svm`, `import_volume`, `import_qtree`, `import_lun`, `import_interface`, `import_export_policy`, `import_export_policy_rule`, `import_snapshot_policy`, `import_quota_rule`, `import_snapmirror`, `import_snapmirror_policy`, `import_job_schedule` | Initial population, one-time imports | Single-object modules |
+| **Bulk Import** (12 roles) | `bulk_import_svm` through `bulk_import_snapmirror` | High-volume initial load with drift detection | Bulk modules, 10–15x faster |
+| **Sync** (11 roles) | `sync_svm` through `sync_snapmirror` | Continuous scheduled sync with full delta detection, orphan handling, and reporting | Bulk modules + Jinja2 comparison |
+| **Support** | `sync_common`, `error_collector`, `facts` | Custom field setup, report generation, error aggregation | — |
+
+See the [Sync Engine](#sync-engine-ontap--netbox) section above for the detailed sync flow.
+
+---
+
+### `netapp_ps.ontap` — ONTAP Execution Roles (44 roles) - MAF based
+
+Direct ONTAP cluster management via REST API. These roles are what actually provisions, modifies, and configures ONTAP resources.
+
+#### Core Roles (MAF)
+
+| Category | Roles |
+|---|---|
+| **Cluster & Network** | `cluster`, `broadcast_domain`, `interface`, `subnet`, `dns`, `vlan` |
+| **SVM & Storage** | `svm`, `volume`, `volume_autosize`, `volume_clone`, `volume_efficiency`, `qtree`, `quota`, `quota_policy` |
+| **NFS** | `nfs`, `export_policy`, `export_policy_rule`, `name_mapping` |
+| **CIFS/SMB** | `cifs`, `cifs_share`, `cifs_acl`, `cifs_local_user`, `cifs_local_group`, `cifs_privilege` |
+| **SAN** | `lun`, `lun_map`, `igroup`, `iscsi` |
+| **Snapshots & Replication** | `snapshot`, `snapshot_policy`, `snapmirror`, `snapmirror_policy` |
+| **Security** | `security_certificate`, `user`, `unix_user`, `unix_group`, `vserver_peer`, `cluster_peer` |
+| **File & Audit** | `file_security_permissions`, `file_security_permissions_acl`, `vserver_audit` |
+| **Advanced** | `qos_policy_group`, `fpolicy_policy`, `fpolicy_event`, `fpolicy_scope`, `fpolicy_ext_engine`, `fpolicy_status`, `software_update`, `vscan_scanner_pool`, `facts` |
+
+---
+
+### `netapp_ps.tollcollect` — Orchestration Roles
+
+These roles bridge the gap between the NetBox CMDB and ONTAP execution. They consume `automation_spec` data from share orders and make intelligent placement decisions.
+
+#### `finder_svm` — Target SVM Discovery
+
+Given a VM and a share order, automatically discovers the correct target SVM by correlating VM network location with ONTAP infrastructure in NetBox:
+
+```
+VM (NetBox)                        ONTAP (NetBox)
+┌─────────────┐                    ┌──────────────────┐
+│ Interfaces  │──── IPv6 prefix ──▶│ SVM LIFs         │
+│ Site/DC     │──── location ─────▶│ SVM site         │
+│ Tenant      │──── ownership ────▶│ SVM tenant       │
+└─────────────┘                    │ SVM purpose      │
+                                   │ SVM protocols    │
+                                   │ MCC-mirrored aggr│
+                                   └──────────────────┘
+```
+
+**Discovery flow:**
+1. Resolve VM interfaces and IPv6 address from NetBox
+2. Determine VM's network prefix and primary datacenter
+3. Query SVMs matching: `svm_purpose` + `tenant` + `site` + `protocol` + `mirrored_aggr` requirement
+4. Cross-reference SVM LIF IPs against VM prefix — only SVMs reachable from VM's network qualify
+5. Assert exactly one unique SVM found (fail-fast on ambiguity)
+6. Return SVM name, cluster management IP, and volume/aggregate placement details
+
+**Supports order-type routing** — different validation and placement logic for `new_volume`, `new_app/default`, and `new_app/oracle_qtree` flows.
+
+**Volume discovery mode** — for `new_app` orders without explicit volume names, queries NetBox volumes by `cf_ontap_data_type` + `cf_ontap_retention_period` + `cf_ontap_provisioning_status=provisioned` and selects the volume with the lowest `qtree_count`.
+
+**Return value:**
+
+```yaml
+finder_svm_result:
+  result: "success"          # or "failed" with diagnostic msg
+  msg: "SVM found successfully"
+  new_app:                   # key matches order_type
+    svm:
+      name: "prod-svm-01"
+    cluster:
+      name: "prod-cluster-01"
+      management_ip: "10.0.0.1"
+    volume:                  # list of volume placements
+      - name: "ora_data_3d_22d_1001"
+        aggregate_name: "aggr_ssd_01"
+        lif_ip: "10.0.1.100"
+        junction_path: "/ora_data_3d_22d_1001"
+```
+
+#### `finder_qtree` — Qtree Target Resolution
+
+Validates and populates qtree data for `new_qtree` orders. Ensures the target volume exists, has capacity, and the qtree name is available.
+
+#### `finder_vault` — SnapMirror Destination Discovery
+
+For protected volumes (`is_protected: true`), discovers the correct vault/destination SVM and generates secondary volume specifications. Validates SVM peering and SnapMirror policy availability.
+
+#### `netbox_share_status` — Provisioning Lifecycle
+
+Updates share order status in NetBox based on ONTAP provisioning results. Validates provisioned resources against the original `automation_spec`, generates mount point specifications from templates, and transitions the order through: `requested → provisioning → completed` (or `failed` with diagnostics).
+
+---
+
+### End-to-End Provisioning Flow
+
+How the three collections work together for a `new_app/oracle_qtree` order:
+
+```
+                     NetBox                    AWX/Ansible                    ONTAP
+                       │                           │                           │
+  Operator submits ───▶│ POST /shares/             │                           │
+  automation_spec      │ (validation + store)      │                           │
+                       │                           │                           │
+  AWX polls ──────────▶│ GET /shares/?status=req   │                           │
+                       │◀──────────────────────────│                           │
+                       │                           │                           │
+                       │  ontap_lookup queries ────▶│ finder_svm               │
+                       │  (VM, SVMs, LIFs,         │ (discover target SVM,    │
+                       │   volumes, prefixes)       │  resolve volumes)         │
+                       │                           │                           │
+                       │                           │ netapp_ps.ontap roles ───▶│
+                       │                           │ • export_policy           │ create EP
+                       │                           │ • export_policy_rule      │ create rules
+                       │                           │ • qtree                   │ create qtrees
+                       │                           │ • quota                   │ set quotas
+                       │                           │ • snapmirror (if protect) │ create SM
+                       │                           │                           │
+                       │◀──── ontap_netbox_* ──────│ Register in NetBox:       │
+                       │  • ontap_netbox_qtree      │ qtrees, export policies, │
+                       │  • ontap_netbox_quota_rule │ quota rules, mount points│
+                       │  • ontap_netbox_export_*   │                           │
+                       │  • ontap_netbox_nas_mount  │                           │
+                       │                           │                           │
+                       │◀── PATCH /shares/{id}/ ───│ netbox_share_status       │
+                       │  provisioning_status:      │ (validate + finalize)     │
+                       │  completed                 │                           │
 ```
 
 ---
@@ -666,23 +935,113 @@ sudo /opt/netbox/venv/bin/python3 manage.py migrate netbox_ontap_nas
 sudo systemctl restart netbox netbox-rq
 ```
 
-### 4. Create Your First Cluster
+### 4. Install the Ansible Collections
 
 ```bash
-curl -k -X POST \
-  -H "Authorization: Token $NETBOX_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "prod-cluster-01",
-    "cluster_type": "mcc_ip",
-    "state": "up"
-  }' \
-  https://netbox.example.com/api/plugins/ontap-nas/clusters/
+# Install all three collections
+ansible-galaxy collection install netapp_ps.ontap_netbox
+ansible-galaxy collection install netapp_ps.ontap
+ansible-galaxy collection install netapp_ps.tollcollect
+
+# Also need the official NetApp collection for ONTAP REST API access
+ansible-galaxy collection install netapp.ontap
 ```
 
-### 5. Import SVM Inventory
+### 5. Import Your First Cluster
 
-Prepare a CSV and upload via UI at `/plugins/ontap-nas/svms/import/`, or POST via API.
+Register the cluster and discover nodes + aggregates in one step:
+
+```yaml
+# import_cluster.yml
+- name: Import ONTAP cluster into NetBox
+  hosts: localhost
+  gather_facts: false
+  vars:
+    netbox:
+      netbox_url: "https://netbox.example.com"
+      netbox_token_secret: "{{ vault_netbox_token }}"
+    ontap:
+      hostname: "10.0.0.1"          # Cluster management IP
+      username: admin
+      password: "{{ vault_ontap_password }}"
+
+  tasks:
+    - name: Import cluster, nodes, and aggregates
+      ansible.builtin.include_role:
+        name: netapp_ps.ontap_netbox.import_cluster
+```
+
+This discovers the cluster name, all nodes (serial numbers, models), and all aggregates (sizes, types, MCC mirror status) — and registers everything in NetBox.
+
+### 6. Sync SVMs and Volumes
+
+```yaml
+# sync_cluster.yml
+- name: Sync ONTAP to NetBox
+  hosts: localhost
+  gather_facts: false
+  vars:
+    _cluster_name: "prod-cluster-01"
+    dry_run: false                    # Set true to preview changes
+    generate_report: true             # Generate Markdown sync report
+    orphan_action: mark               # 'mark' or 'delete'
+    netbox:
+      netbox_url: "https://netbox.example.com"
+      netbox_token_secret: "{{ vault_netbox_token }}"
+    ontap:
+      hostname: "10.0.0.1"
+      username: admin
+      password: "{{ vault_ontap_password }}"
+
+  tasks:
+    - name: Sync SVMs
+      ansible.builtin.include_role:
+        name: netapp_ps.ontap_netbox.sync_svm
+
+    - name: Sync volumes
+      ansible.builtin.include_role:
+        name: netapp_ps.ontap_netbox.sync_volume
+
+    - name: Sync interfaces
+      ansible.builtin.include_role:
+        name: netapp_ps.ontap_netbox.sync_interface
+
+    - name: Sync export policies
+      ansible.builtin.include_role:
+        name: netapp_ps.ontap_netbox.sync_export_policy
+
+    - name: Sync export policy rules
+      ansible.builtin.include_role:
+        name: netapp_ps.ontap_netbox.sync_export_policy_rule
+
+    - name: Sync SnapMirror relationships
+      ansible.builtin.include_role:
+        name: netapp_ps.ontap_netbox.sync_snapmirror
+```
+
+Run with `dry_run: true` first to see the delta report without making changes. When satisfied, set `dry_run: false` and let the sync apply.
+
+### 7. Query NetBox from Playbooks
+
+```yaml
+# Use the lookup plugin to query ONTAP objects
+- name: Find all running SVMs on a cluster
+  ansible.builtin.debug:
+    msg: "SVM: {{ item.value.name }} — services: {{ item.value.enabled_services }}"
+  loop: "{{ query('netapp_ps.ontap_netbox.ontap_lookup', 'ontap.svms',
+                  api_endpoint=netbox.netbox_url,
+                  token=netbox.netbox_token_secret,
+                  validate_certs=false,
+                  api_filter='cluster__name=prod-cluster-01 admin_state=running') }}"
+```
+
+### 8. Schedule Continuous Sync
+
+Create an AWX/AAP job template with the sync playbook and set a recurring schedule (e.g., every 4 hours). Each run:
+- Detects new objects (creates in NetBox)
+- Detects changed fields (updates in NetBox with `changed_fields` in report)
+- Detects removed objects (marks as orphaned)
+- Generates a Markdown report with full diff summary
 
 ---
 
