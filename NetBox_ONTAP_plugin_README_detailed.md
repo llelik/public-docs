@@ -493,7 +493,7 @@ Every sync run generates a Markdown report:
 | ora_arch_3d_22d_1004 | junction_path: /arch_old → /arch_1004    |
 ```
 
-This runs idempotently on a schedule (AWX job template, cron, etc.) to keep NetBox in sync with reality. After initial import, typical sync runs complete in under 60 seconds per cluster with the bulk modules.
+This runs idempotently on a schedule (AWX job template, cron, etc.) to keep NetBox in sync with reality. After initial import, typical sync runs complete in under 10 minutes per cluster with the bulk modules and all ONTAP objects sync enabled. Exact time depends on number of instances per object.
 
 #### Custom Fields Managed by Sync
 
