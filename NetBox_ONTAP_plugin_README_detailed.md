@@ -4,7 +4,7 @@
 
 A NetBox plugin that models the complete ONTAP NAS stack as a structured, API-first CMDB — from clusters and nodes down to qtrees, quota rules, and export policy rules. Built for storage automation teams who need a single source of truth for ONTAP infrastructure and tenant provisioning workflows.
 
-**Version:** 0.0.18 (WIP)
+**Version:** 0.0.18 (WIP)  
 **NetBox:** 4.5.x  
 **Python:** 3.12+  
 **License:** TBD (internal distribution)
