@@ -1,10 +1,10 @@
 # NetBox ONTAP NAS Plugin
 
-**ONTAP Infrastructure as Code — powered by NetBox**
+**ONTAP CMDB Automated — powered by NetBox**
 
 A NetBox plugin that models the complete ONTAP NAS stack as a structured, API-first CMDB — from clusters and nodes down to qtrees, quota rules, and export policy rules. Built for storage automation teams who need a single source of truth for ONTAP infrastructure and tenant provisioning workflows.
 
-**Version:** 0.0.18  
+**Version:** 0.0.18  (WIP)
 **NetBox:** 4.5.x  
 **Python:** 3.12+  
 **License:** TBD (internal distribution)
@@ -451,6 +451,7 @@ Each sync role follows the same architecture:
 | Export Policy Rules | `sync_export_policy_rule` | `policy:index` | clientmatch, protocols, ro/rw/superuser, allow_suid |
 | Snapshot Policies | `sync_snapshot_policy` | `svm:name` | scope, enabled, ontap_details |
 | Quota Rules | `sync_quota_rule` | `svm:volume:type:target` | space_hard_limit, space_soft_limit, files_hard_limit |
+| Job Schedules | `sync_job_schedule` | `svm:name` | schedule_type, cron_expression, interval_iso |
 | SnapMirror Policies | `sync_snapmirror_policy` | `name` | policy_type, sync_type, identity_preservation |
 | SnapMirror Relationships | `sync_snapmirror` | `source:dest` | protection_type, state, policy, schedule |
 
@@ -838,71 +839,88 @@ How the three collections work together for a `new_app/oracle_qtree` order:
 
 ---
 
-## Appliance Roadmap
+## Provisioning Architecture
 
-### Vision
+The provisioning engine lives in the `automation_core` repository and orchestrates three collections to turn NetBox `automation_spec` orders into running ONTAP resources. It follows the **MAF pattern** (Mirko Ansible Framework): each ONTAP object type has a dedicated `netapp_ps.ontap` role for create/update/delete, and a matching `netapp_ps.ontap_netbox` module to register the result in NetBox.
 
-Package this plugin as a **ready-to-deploy appliance** — a VM image (VMware OVA / KVM qcow2) with everything preinstalled. Download, deploy, point at your ONTAP clusters, run the sync playbook, done.
+### AWX Entry Points
 
-### Phase 1: Core Appliance
+The engine exposes three AWX job template endpoints:
 
-- [ ] Pre-built VM image (Ubuntu 24.04 LTS)
-- [ ] NetBox 4.5.x installed and configured
-- [ ] Plugin pre-installed in editable mode
-- [ ] PostgreSQL + Redis configured
-- [ ] nginx reverse proxy with self-signed cert
-- [ ] systemd units for netbox + netbox-rq
-- [ ] First-boot configuration wizard (admin password, site URL)
+| Endpoint Playbook | Trigger | Purpose |
+|---|---|---|
+| `netbox_share_endpoint.yaml` | Share order (`new_app`, `new_volume`, `new_qtree`) | Application-aware provisioning with SVM discovery, volume placement, and full storage stack creation |
+| `netbox_generic_endpoint.yml` | Individual NetBox object (`ontapsvm`, `ontapvolume`, `ontapsnapmirror`, `ontapquotarule`) | Single-object provisioning — create one SVM, volume, or SnapMirror relationship on demand |
+| `trunk/netbox_provision.yml` | Legacy NetBox→MAF transformation | Direct volume/SVM creation with size conversion and template matching |
 
-### Phase 2: Ansible Integration Built-In
+### Current Provisioning Capabilities
 
-- [ ] Ansible installed in a dedicated venv
-- [ ] `netapp.ontap` collection pre-installed
-- [ ] Custom `netbox_ontap_*` Ansible modules packaged
-- [ ] Sync playbooks in `/opt/ontap-nas/playbooks/sync/`
-- [ ] Provisioning playbooks in `/opt/ontap-nas/playbooks/provision/`
-- [ ] Credential management (Ansible Vault or HashiCorp Vault integration)
+| Operation | ONTAP Role (MAF) | NetBox Registration | Status |
+|---|---|---|---|
+| SVM create (full stack: NFS/CIFS/iSCSI services, DNS, root volume) | `svm` | `ontap_netbox_svm` | Done |
+| Volume create (size conversion, aggregate, junction path, security style) | `volume` | `ontap_netbox_volume` | Done |
+| Qtree create (security style, unix permissions) | `qtree` | `ontap_netbox_qtree` | Done |
+| Export Policy create | `export_policy` | `ontap_netbox_export_policy` | Done |
+| Export Policy Rule create (clients, ro/rw/su, SUID, protocols) | `export_policy_rule` | `ontap_netbox_export_policy_rule` | Done |
+| Quota Rule create/update (tree quotas, space/file limits) + quota enable | `quota` | `ontap_netbox_quota_rule` | Done |
+| SnapMirror create (async/sync, via `finder_vault` discovery) | `snapmirror` | `ontap_netbox_snapmirror` | Done |
+| Mount Point registration | — | `ontap_netbox_nas_mount_point` | Done |
+| Share status lifecycle (`requested` → `provisioning` → `completed`/`failed`) | — | `ontap_netbox_nas_share` | Done |
+
+### Order Processing Flow
+
+The provisioning engine is event-driven via AWX/AAP:
+
+1. **Order ingestion** — Operator or upstream system submits a `TenantNASShare` with `automation_spec` via NetBox API
+2. **Order pickup** — AWX job template polls for `provisioning_status=requested` orders
+3. **SVM discovery** — `finder_svm` role resolves the target SVM based on VM location, tenant, protocol, and network reachability
+4. **Volume resolution** — Explicit volume names are validated against NetBox; discovery-mode volumes are resolved by `(data_type, retention_period)` matching
+5. **Payload transformation** — `share_to_maf` filter converts the `automation_spec` into MAF `vars_local` format (size unit conversion GiB→MiB, cluster/SVM context injection, template selection)
+6. **ONTAP execution loop** — For each storage item, `netapp_ps.ontap` roles execute in dependency order:
+   - Export policy + rules → Volume (if new) → Qtree → Quota → Enable quotas on volume → SnapMirror (if `is_protected`)
+7. **NetBox registration** — `netapp_ps.ontap_netbox` modules register each created object back into the CMDB
+8. **Finalization** — `netbox_share_status` role validates the provisioned state against the spec, creates mount point records, and transitions the order to `completed`
+
+All provisioning tasks use block/rescue patterns — on failure, the share status is set to `failed` with error details written to the NetBox comments field.
+
+### Supported Order Types
+
+| Order Type | Entry Task | What Gets Created |
+|---|---|---|
+| `new_app` (default) | `provision_new_app.yml` | Volumes + export policies + rules. SVM discovery via `finder_svm`. Supports explicit and discovery-mode volume placement. |
+| `new_app` (oracle_qtree) | `provision_new_app.yml` | Discovers existing volumes by `(data_type, retention_period)`, creates qtrees + quotas + export policies on each. Full Oracle SID provisioning (arch, redo, data, temp, base, app). |
+| `new_volume` | `provision_new_volume.yml` | Single or multiple volumes with aggregate placement. SVM discovery or explicit. |
+| `new_qtree` | `provision_new_qtree.yml` | Qtrees in existing volumes. Uses `finder_qtree` for target resolution. Creates quotas and export policies per qtree. |
+| Generic SVM | `provision_generic_ontapsvm.yml` | Full SVM with protocol stack (NFS/CIFS/iSCSI/FCP), DNS, root volume, aggregate list, ipspace. |
+| Generic SnapMirror | `provision_generic_ontapsnapmirror.yml` | SnapMirror relationship via `finder_vault` (destination SVM/cluster discovery, peering validation). |
+
+The design goal is full coverage: for every ONTAP object type modeled in the plugin, there should be a matching provisioning playbook that can create, update, or delete it — and register the outcome in NetBox.
+
+---
+
+## Roadmap
+
+### Data Model Enhancements
+
+- [ ] **`ontap_details` field on all infrastructure models** — A JSON field storing the raw ONTAP REST API response for each object. This enables full IaC replay: given a NetBox export, you can reconstruct any ONTAP object exactly as it exists on the cluster. Currently available on `ONTAPSnapshotPolicy` and `ONTAPSnapMirrorPolicy`; planned for all 15 infrastructure models.
+- [ ] **ONTAP S3 Bucket model** — `ONTAPBucket` to track S3 buckets per SVM (name, size, versioning, policy, lifecycle rules)
+- [ ] **Vserver Peering model** — `ONTAPVserverPeer` to track SVM peering relationships (source SVM, destination SVM, peer cluster, applications, state)
+
+### Provisioning Enhancements
+
+- [ ] **Volume delete/decommission** — Reverse provisioning lifecycle: delete qtrees, quotas, export policies, SnapMirror relationships; update NetBox records; transition share to `decommissioned`
+- [ ] **LIF provisioning** — Network interface creation as part of SVM provisioning
+- [ ] **Execution log persistence to Git** — Provisioning runs save structured execution logs (order ID, timestamps, tasks executed, ONTAP responses, success/failure) to a Git repository for full audit trail and replay capability
+- [ ] **`new_qtree` order type in share endpoint** — End-to-end qtree provisioning through the share order workflow (currently available via generic endpoint)
+
+### Appliance
+
+- [ ] Pre-built VM image (Ubuntu 24.04 LTS) with all components pre-installed
+- [ ] **AWX** deployed in the appliance for playbook execution, job scheduling, webhook-driven provisioning, and credential management
+- [ ] **AnsibleForms** deployed in the appliance as the operator-facing UI for maintenance operations, ad-hoc provisioning, and parameter-driven form submissions
+- [ ] First-boot configuration wizard (admin password, site URL, ONTAP credentials)
 - [ ] Cron job templates for scheduled sync
-
-### Phase 3: Operational Features
-
-- [ ] Built-in drift detection (NetBox vs live ONTAP state)
-- [ ] Dashboard with cluster health, provisioning queue, orphaned mount points
-- [ ] Webhook integration for order-driven provisioning (order created → Ansible runs automatically)
-- [ ] Grafana dashboard templates for storage utilization
-- [ ] Backup/restore scripts for the appliance
-
-### Phase 4: Multi-Platform
-
-- [ ] VMware OVA export with OVF properties
-- [ ] KVM/libvirt qcow2 image
-- [ ] Docker Compose deployment option
-- [ ] Kubernetes Helm chart
-- [ ] Terraform provider for NetBox plugin resources
-
-### Appliance Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│              ONTAP NAS Appliance VM                  │
-│                                                     │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
-│  │  nginx   │  │  NetBox  │  │  Ansible Engine  │  │
-│  │  :443    ├──│  :8001   │  │  (sync + prov)   │  │
-│  └──────────┘  └────┬─────┘  └────────┬─────────┘  │
-│                     │                  │            │
-│              ┌──────┴─────┐    ┌───────┴────────┐   │
-│              │ PostgreSQL │    │ ONTAP Clusters  │   │
-│              │ + Redis    │    │ (REST API)      │   │
-│              └────────────┘    └────────────────┘   │
-│                                                     │
-│  Pre-installed:                                     │
-│  • netbox-ontap-nas plugin                          │
-│  • na_ontap Ansible collection                     │
-│  • Sync & provisioning playbooks                   │
-│  • Custom netbox_ontap_* Ansible modules           │
-└─────────────────────────────────────────────────────┘
-```
+- [ ] VMware OVA / KVM qcow2 / Docker Compose deployment options
 
 ---
 
@@ -998,14 +1016,6 @@ This discovers the cluster name, all nodes (serial numbers, models), and all agg
       ansible.builtin.include_role:
         name: netapp_ps.ontap_netbox.sync_svm
 
-    - name: Sync volumes
-      ansible.builtin.include_role:
-        name: netapp_ps.ontap_netbox.sync_volume
-
-    - name: Sync interfaces
-      ansible.builtin.include_role:
-        name: netapp_ps.ontap_netbox.sync_interface
-
     - name: Sync export policies
       ansible.builtin.include_role:
         name: netapp_ps.ontap_netbox.sync_export_policy
@@ -1013,6 +1023,14 @@ This discovers the cluster name, all nodes (serial numbers, models), and all agg
     - name: Sync export policy rules
       ansible.builtin.include_role:
         name: netapp_ps.ontap_netbox.sync_export_policy_rule
+
+    - name: Sync volumes
+      ansible.builtin.include_role:
+        name: netapp_ps.ontap_netbox.sync_volume
+
+    - name: Sync interfaces
+      ansible.builtin.include_role:
+        name: netapp_ps.ontap_netbox.sync_interface
 
     - name: Sync SnapMirror relationships
       ansible.builtin.include_role:
