@@ -4,7 +4,7 @@
 
 A NetBox plugin that models the complete ONTAP NAS stack as a structured, API-first CMDB — from clusters and nodes down to qtrees, quota rules, and export policy rules. Built for storage automation teams who need a single source of truth for ONTAP infrastructure and tenant provisioning workflows.
 
-**Version:** 0.0.18 (WIP)  
+**Version:** 0.1.5  
 **NetBox:** 4.5.x  
 **Python:** 3.12+  
 **License:** TBD (internal distribution)
@@ -60,10 +60,12 @@ This plugin solves all of the above by giving ONTAP a proper CMDB layer with:
 │        ├── ONTAPsvm ───┤── ONTAPVolume ── ONTAPQtree             │
 │        │   (data/admin) │       │              │                 │
 │        │               │       ├── ONTAPLUN    ├── ONTAPQuotaRule │
-│        │               │       │               │                 │
-│        ├── ONTAPTier    │       └── ONTAPExportPolicy             │
-│        │   (aggr/cloud) │            └── ONTAPExportPolicyRule    │
-│        │               │                                         │
+│        │               │       │    │          │                 │
+│        │               │       │    └── ONTAPLUNMap (→ igroup)   │
+│        ├── ONTAPigroup  │       └── ONTAPExportPolicy             │
+│        │   (SAN hosts)  │            └── ONTAPExportPolicyRule    │
+│        ├── ONTAPTier    │                                         │
+│        │   (aggr/cloud) │                                         │
 │        ├── ONTAPInterface (data LIFs, with IP from NetBox IPAM)  │
 │        │                                                         │
 │        ├── ONTAPSnapshotPolicy                                   │
@@ -72,7 +74,7 @@ This plugin solves all of the above by giving ONTAP a proper CMDB layer with:
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Infrastructure layer** — 15 models that map 1:1 to ONTAP REST API resources. Every field name matches what you'd see in `ontap_rest_cli` or the ONTAP REST API docs. No abstraction, no translation layer — `volume.size` is bytes, `security_style` is `unix|ntfs|mixed`, `snaplock_type` is `non_snaplock|enterprise|compliance`.
+**Infrastructure layer** — 17 models that map 1:1 to ONTAP REST API resources. Every field name matches what you'd see in `ontap_rest_cli` or the ONTAP REST API docs. No abstraction, no translation layer — `volume.size` is bytes, `security_style` is `unix|ntfs|mixed`, `snaplock_type` is `non_snaplock|enterprise|compliance`.
 
 **Tenant services layer** — 2 models that add business context. A `TenantNASShare` is a provisioning order that carries a full `automation_spec` JSON — think of it as the desired-state document that Ansible consumes. A `TenantNASMountPoint` tracks where each volume/qtree is actually mounted on VMs.
 
@@ -80,7 +82,7 @@ This plugin solves all of the above by giving ONTAP a proper CMDB layer with:
 
 ## Data Model Reference
 
-### Infrastructure Models (15)
+### Infrastructure Models (17)
 
 | Model | ONTAP Equivalent | Key Fields | Relationships |
 |-------|-----------------|------------|---------------|
@@ -91,6 +93,8 @@ This plugin solves all of the above by giving ONTAP a proper CMDB layer with:
 | **ONTAPVolume** | `storage/volumes` | name, size, voltype (RW/RO/DP), volstate, encryption, snaplock_type, mount_path, space_reservation, autosize_mode, security_style, language | → Cluster, SVM, Tier (M2M), ExportPolicy, SnapshotPolicy, ParentVolume (clone) |
 | **ONTAPQtree** | `storage/qtrees` | name, security_style | → Cluster, SVM, Volume, ExportPolicy, QuotaRule |
 | **ONTAPLUN** | `storage/luns` | name (auto-built path), logical_unit, os_type, size | → Cluster, SVM, Volume, Qtree |
+| **ONTAPigroup** | `protocols/san/igroups` | name, protocol (iscsi/fcp/mixed), os_type, initiators[] (IQNs/WWPNs), ontap_uuid | → Cluster, SVM |
+| **ONTAPLUNMap** | `protocols/san/lun-maps` | logical_unit_number (LUN ID, auto-assigned if omitted) | → LUN, igroup, Cluster/SVM (denormalized from LUN) |
 | **ONTAPInterface** | `network/ip/interfaces` | name, ip_address, netmask, admin_state, home_node, home_port_name, enabled_services[] | → Cluster, SVM, IPAddress, Node |
 | **ONTAPExportPolicy** | `protocols/nfs/export-policies` | name | → Cluster, SVM |
 | **ONTAPExportPolicyRule** | `export-policies/{id}/rules` | rule_index, access_proto[], clientmatch, rorule[], rwrule[], superuser[], allow_suid, allow_dev | → ExportPolicy, Cluster, SVM |
@@ -99,6 +103,8 @@ This plugin solves all of the above by giving ONTAP a proper CMDB layer with:
 | **ONTAPSnapMirror** | `snapmirror/relationships` | protection_type (SVMDR/VSM/CG) | → source/dest Cluster, SVM, Volumes (M2M), SnapMirrorPolicy, JobSchedule |
 | **ONTAPSnapMirrorPolicy** | `snapmirror/policies` | policy_type (async/sync/continuous), sync_type, identity_preservation, ontap_details (JSON) | → Cluster, SVM, JobSchedule |
 | **ONTAPJobSchedule** | `cluster/schedules` | schedule_type (cron/interval), cron_expression, interval_iso | → Cluster, SVM |
+
+Every infrastructure model — including `ONTAPigroup` and `ONTAPLUNMap` — carries a NetBox `Owner` field, so accountability and self-service permission scoping apply consistently across all 17 models.
 
 ### Services Models (2)
 
@@ -119,6 +125,8 @@ Constraints follow ONTAP's actual uniqueness rules:
 | SVM | Cluster | name |
 | Volume | SVM | name (within same cluster+SVM) |
 | Qtree | Volume | name (within same cluster+SVM+volume) |
+| igroup | Cluster + SVM | name |
+| LUN Map | — | lun + igroup (a LUN can only be mapped to a given igroup once); LUN ID unique per igroup |
 | Interface | SVM | name |
 | ExportPolicy | SVM | name |
 | SnapshotPolicy | SVM | name |
@@ -141,6 +149,8 @@ Every model has a full CRUD endpoint under `/api/plugins/ontap-nas/`. Standard D
 | `/api/plugins/ontap-nas/volumes/` | GET, POST, PUT, PATCH, DELETE | Yes |
 | `/api/plugins/ontap-nas/qtrees/` | GET, POST, PUT, PATCH, DELETE | Yes |
 | `/api/plugins/ontap-nas/luns/` | GET, POST, PUT, PATCH, DELETE | Yes |
+| `/api/plugins/ontap-nas/igroups/` | GET, POST, PUT, PATCH, DELETE | Yes |
+| `/api/plugins/ontap-nas/lun-maps/` | GET, POST, PUT, PATCH, DELETE | Yes |
 | `/api/plugins/ontap-nas/interfaces/` | GET, POST, PUT, PATCH, DELETE | Yes |
 | `/api/plugins/ontap-nas/export-policies/` | GET, POST, PUT, PATCH, DELETE | Yes |
 | `/api/plugins/ontap-nas/export-policy-rules/` | GET, POST, PUT, PATCH, DELETE | Yes |
@@ -576,7 +586,7 @@ netapp_ps.tollcollect           Orchestration layer — finder_svm, finder_qtree
 
 ### `netapp_ps.ontap_netbox` — NetBox CMDB Modules
 
-#### Single-Object Modules (18)
+#### Single-Object Modules (20)
 
 Full CRUD for every ONTAP object type in NetBox. Idempotent, with state=present/absent semantics.
 
@@ -589,6 +599,8 @@ Full CRUD for every ONTAP object type in NetBox. Idempotent, with state=present/
 | `ontap_netbox_volume` | Manage volumes (RW/RO/DP, FlexGroup, clones) |
 | `ontap_netbox_qtree` | Manage qtrees |
 | `ontap_netbox_lun` | Manage LUNs (SAN block storage) |
+| `ontap_netbox_igroup` | Manage initiator groups (iSCSI IQNs / FC WWPNs) |
+| `ontap_netbox_lun_map` | Manage LUN-to-igroup mappings (LUN ID assignment) |
 | `ontap_netbox_interface` | Manage LIFs (data/mgmt, IPv4/IPv6, services) |
 | `ontap_netbox_export_policy` | Manage NFS export policies |
 | `ontap_netbox_export_policy_rule` | Manage individual export policy rules |
@@ -621,7 +633,7 @@ Full CRUD for every ONTAP object type in NetBox. Idempotent, with state=present/
       export_policy: { name: default }
 ```
 
-#### Bulk Modules (12) — 10–15x Faster
+#### Bulk Modules (14) — 10–15x Faster
 
 For large-scale import and sync operations. Process hundreds of objects per API call with batched transactions, partial success handling, and detailed error reporting.
 
@@ -631,6 +643,8 @@ For large-scale import and sync operations. Process hundreds of objects per API 
 | `ontap_netbox_volume_bulk` | 100 |
 | `ontap_netbox_qtree_bulk` | 100 |
 | `ontap_netbox_lun_bulk` | 100 |
+| `ontap_netbox_igroup_bulk` | 100 |
+| `ontap_netbox_lun_map_bulk` | 100 |
 | `ontap_netbox_interface_bulk` | 100 |
 | `ontap_netbox_export_policy_bulk` | 100 |
 | `ontap_netbox_export_policy_rule_bulk` | 100 |
@@ -902,7 +916,7 @@ The design goal is full coverage: for every ONTAP object type modeled in the plu
 
 ### Data Model Enhancements
 
-- [ ] **`ontap_details` field on all infrastructure models** — A JSON field storing the raw ONTAP REST API response for each object. This enables full IaC replay: given a NetBox export, you can reconstruct any ONTAP object exactly as it exists on the cluster. Currently available on `ONTAPSnapshotPolicy` and `ONTAPSnapMirrorPolicy`; planned for all 15 infrastructure models.
+- [ ] **`ontap_details` field on all infrastructure models** — A JSON field storing the raw ONTAP REST API response for each object. This enables full IaC replay: given a NetBox export, you can reconstruct any ONTAP object exactly as it exists on the cluster. Currently available on `ONTAPSnapshotPolicy` and `ONTAPSnapMirrorPolicy`; planned for all 17 infrastructure models.
 - [ ] **ONTAP S3 Bucket model** — `ONTAPBucket` to track S3 buckets per SVM (name, size, versioning, policy, lifecycle rules)
 - [ ] **Vserver Peering model** — `ONTAPVserverPeer` to track SVM peering relationships (source SVM, destination SVM, peer cluster, applications, state)
 

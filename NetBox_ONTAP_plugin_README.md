@@ -15,17 +15,20 @@ This plugin closes that gap.
 
 ## Data Model
 
-17 models covering the full ONTAP object hierarchy:
+17 models covering the full ONTAP object hierarchy, including SAN objects (igroups and LUN maps):
 
 ```
 ONTAPCluster
 ├── ONTAPNode (1:N)
 ├── ONTAPTier / Aggregate (1:N)
+├── ONTAPigroup (1:N)
+│   └── ONTAPLUNMap (N:N with ONTAPLUN, via igroup)
 ├── ONTAPsvm (1:N)
 │   ├── ONTAPVolume (1:N)
 │   │   ├── ONTAPQtree (1:N)
 │   │   │   └── ONTAPQuotaRule (1:N)
 │   │   └── ONTAPLUN (1:N)
+│   │       └── ONTAPLUNMap (1:N, mapped to an igroup)
 │   ├── ONTAPInterface (1:N)
 │   ├── ONTAPExportPolicy (1:N)
 │   │   └── ONTAPExportPolicyRule (1:N)
@@ -47,6 +50,8 @@ ONTAPCluster
 | **ONTAPQtree** | name, security_style, export_policy, volume | volume + name | Links to parent volume and quota rules |
 | **ONTAPQuotaRule** | type, volume, qtree, space hard/soft limits, file limits | — | Types: tree/user/group. Binary unit display |
 | **ONTAPLUN** | name, os_type, size, volume, qtree | svm + name | 13 OS types. Links to volume and optional qtree |
+| **ONTAPigroup** | name, protocol, os_type, initiators, cluster, svm | cluster + svm + name | Initiator group (iSCSI IQNs / FC WWPNs) controlling host access to LUNs |
+| **ONTAPLUNMap** | lun, igroup, logical_unit_number, cluster, svm (denormalized) | lun + igroup | Maps a LUN to an igroup with an optional LUN ID; cluster/svm auto-populated from the LUN |
 | **ONTAPInterface** | name, ip_address, admin_state, home_node, home_port, ipspace, enabled_services | — | Up to 30 services. VLAN tag extraction. IPspace-aware IP uniqueness |
 | **ONTAPExportPolicy** | name, svm | svm + name | Container for export rules |
 | **ONTAPExportPolicyRule** | index, clientmatch, ro_rule, rw_rule, superuser, protocols | export_policy + index | Full NFS export ACL modeling |
@@ -63,7 +68,7 @@ Every model integrates with NetBox core:
 - **Site** (FK) — Cluster, Node, SVM, Interface
 - **Device** (FK) — Node (physical chassis)
 - **IPAddress** (FK) — Cluster (management), Interface
-- **Owner** (FK) — All 17 models (NetBox 4.5+ owner assignment)
+- **Owner** (FK) — All 17 infrastructure models, including `ONTAPigroup` and `ONTAPLUNMap` (NetBox 4.5+ owner assignment; consistent across every infrastructure model)
 - **Tags** — All models (NetBox tagging system)
 - **Custom Fields** — All models
 - **Journal Entries** — All models
@@ -83,6 +88,8 @@ Base URL: `/api/plugins/ontap-nas/`
 | `qtrees/` | ONTAPQtree | GET, POST, PUT, PATCH, DELETE |
 | `quota-rules/` | ONTAPQuotaRule | GET, POST, PUT, PATCH, DELETE |
 | `luns/` | ONTAPLUN | GET, POST, PUT, PATCH, DELETE |
+| `igroups/` | ONTAPigroup | GET, POST, PUT, PATCH, DELETE |
+| `lun-maps/` | ONTAPLUNMap | GET, POST, PUT, PATCH, DELETE |
 | `interfaces/` | ONTAPInterface | GET, POST, PUT, PATCH, DELETE |
 | `export-policies/` | ONTAPExportPolicy | GET, POST, PUT, PATCH, DELETE |
 | `export-policy-rules/` | ONTAPExportPolicyRule | GET, POST, PUT, PATCH, DELETE |
@@ -256,6 +263,8 @@ One module per object type for idempotent Create, Update, Delete operations (`st
 | `ontap_netbox_qtree` | `qtrees/` |
 | `ontap_netbox_quota_rule` | `quota-rules/` |
 | `ontap_netbox_lun` | `luns/` |
+| `ontap_netbox_igroup` | `igroups/` |
+| `ontap_netbox_lun_map` | `lun-maps/` |
 | `ontap_netbox_interface` | `interfaces/` |
 | `ontap_netbox_export_policy` | `export-policies/` |
 | `ontap_netbox_export_policy_rule` | `export-policy-rules/` |
@@ -277,6 +286,8 @@ High-performance bulk operations for large-scale imports (10–15x faster than i
 | `ontap_netbox_qtree_bulk` | Bulk qtrees |
 | `ontap_netbox_quota_rule_bulk` | Bulk quota rules |
 | `ontap_netbox_lun_bulk` | Bulk LUNs |
+| `ontap_netbox_igroup_bulk` | Bulk igroups |
+| `ontap_netbox_lun_map_bulk` | Bulk LUN maps |
 | `ontap_netbox_interface_bulk` | Bulk interfaces |
 | `ontap_netbox_export_policy_bulk` | Bulk export policies |
 | `ontap_netbox_export_policy_rule_bulk` | Bulk export policy rules |
@@ -288,7 +299,7 @@ High-performance bulk operations for large-scale imports (10–15x faster than i
 
 A single lookup plugin `ontap_lookup` queries any ONTAP object type from NetBox. The object type is specified as the first argument using dot-prefixed terms (`ontap.*` for infrastructure, `nastenant.*` for services).
 
-Supported terms: `ontap.clusters`, `ontap.svms`, `ontap.volumes`, `ontap.qtrees`, `ontap.quota-rules`, `ontap.luns`, `ontap.interfaces`, `ontap.export-policies`, `ontap.export-policy-rules`, `ontap.snapshot-policies`, `ontap.snapmirror-policies`, `ontap.job-schedules`, `ontap.snapmirror-relationships`, `ontap.nodes`, `ontap.tiers`, `nastenant.shares`, `nastenant.mount-points`.
+Supported terms: `ontap.clusters`, `ontap.svms`, `ontap.volumes`, `ontap.qtrees`, `ontap.quota-rules`, `ontap.luns`, `ontap.igroups`, `ontap.lun-maps`, `ontap.interfaces`, `ontap.export-policies`, `ontap.export-policy-rules`, `ontap.snapshot-policies`, `ontap.snapmirror-policies`, `ontap.job-schedules`, `ontap.snapmirror-relationships`, `ontap.nodes`, `ontap.tiers`, `nastenant.shares`, `nastenant.mount-points`.
 
 ### CUD Module Example
 
@@ -420,6 +431,7 @@ Both playbooks use `nolog: true` for ONTAP credential tasks and support `--limit
 
 | Component | Version |
 |-----------|---------|
+| netbox-ontap-nas (this plugin) | 0.1.5 |
 | NetBox | 4.5.0+ |
 | Python | 3.12+ |
 | Django | 5.0+ |
